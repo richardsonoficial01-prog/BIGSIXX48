@@ -1,6 +1,3 @@
-
-
-
     const state = {
       sourceVersion: 0, busy: false, backend: "",
       sourceTab: "youtube",
@@ -867,6 +864,8 @@ async function exportEditedMp4() {
       let stream,recorder,drawTimer;
       const tracks=[];
       try {
+        vid.muted=true;
+        await vid.play().catch(()=>{});
         await ensureBackend();
         if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) throw new Error("Este navegador não suporta gravação de vídeo. Abra no Chrome ou Safari atualizado.");
         const canvas=document.createElement("canvas");canvas.width=1080;canvas.height=1920;
@@ -1147,14 +1146,20 @@ ${c.text}
       return waitJob(await requestJson(path,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:blob,signal}),progress,cancelled);
     }
     async function seekVideo(video,time) {
-      if(!video.seeking && Math.abs(video.currentTime-time)<0.005)return;
-      await new Promise((resolve,reject)=>{
-        const cleanup=()=>{clearTimeout(timer);video.removeEventListener("seeked",done);video.removeEventListener("error",error);};
-        const done=()=>{cleanup();resolve();};
-        const error=()=>{cleanup();reject(new Error("Não foi possível posicionar o vídeo."));};
-        const timer=setTimeout(error,15000);
-        video.addEventListener("seeked",done,{once:true});video.addEventListener("error",error,{once:true});
-        video.currentTime=Math.max(0,Math.min(video.duration,time));
+      if(video.readyState<1){
+        video.load();
+        await new Promise(r=>{video.addEventListener("loadedmetadata",r,{once:true});setTimeout(r,4000);});
+      }
+      const dur=Number.isFinite(video.duration)&&video.duration>0?video.duration:time;
+      const target=Math.max(0,Math.min(dur,time));
+      if(!video.seeking && Math.abs(video.currentTime-target)<0.05)return;
+      await new Promise(resolve=>{
+        let doneFlag=false;
+        const finish=()=>{if(doneFlag)return;doneFlag=true;clearTimeout(timer);video.removeEventListener("seeked",finish);video.removeEventListener("error",finish);resolve();};
+        const timer=setTimeout(finish,3500);
+        video.addEventListener("seeked",finish,{once:true});
+        video.addEventListener("error",finish,{once:true});
+        try{video.currentTime=target;}catch(_){finish();}
       });
     }
     function captionsForRange(start,end) {
