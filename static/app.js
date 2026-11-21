@@ -15,6 +15,7 @@
         words: [],
         tracking: [],
         id: null,
+        cleanDownloadUrl: "",
         socialUrl: "",
         width: 1280,
         height: 720,
@@ -34,7 +35,7 @@
         panX: 0,
         captionStyle: "opus",
         captionsOn: true,
-        watermarkPos: "top",
+        watermarkPos: "hidden",
       },
       playback: {
         rafId: null,
@@ -132,8 +133,10 @@
       try {
         const u = new URL(s);
         const host = u.hostname.toLowerCase().replace(/^www\./, "");
+        if (!host || !host.includes(".")) return null;
+
         if (host.includes("youtube.com") || host === "youtu.be") {
-          return { platform: "YouTubeBlocked", url: u.href };
+          return { platform: "YouTube", url: u.href, color: "#f87171", bg: "rgba(248,113,113,0.16)" };
         }
         if (host.includes("instagram.com") || host.includes("instagr.am")) {
           return { platform: "Instagram", url: u.href, color: "#f472b6", bg: "rgba(244,114,182,0.16)" };
@@ -147,7 +150,11 @@
         if (host.includes("tiktok.com") || host.includes("tiktokv.com")) {
           return { platform: "TikTok", url: u.href, color: "#2dd4bf", bg: "rgba(45,212,191,0.16)" };
         }
-        return null;
+        if (host === "x.com" || host.includes("twitter.com")) {
+          return { platform: "X / Twitter", url: u.href, color: "#e4e4e7", bg: "rgba(228,228,231,0.16)" };
+        }
+        const label = host.split(".")[0].charAt(0).toUpperCase() + host.split(".")[0].slice(1);
+        return { platform: label, url: u.href, color: "#34d399", bg: "rgba(52,211,153,0.16)" };
       } catch (_) {
         return null;
       }
@@ -188,27 +195,15 @@
       const authorEl = document.getElementById("social-author-text");
       const noteEl = document.getElementById("social-stream-note");
 
-      if (parsed && parsed.platform === "YouTubeBlocked") {
-        state.social.platform = "";
-        state.social.url = "";
-        badge.style.background = "rgba(255,0,51,0.18)";
-        badge.style.color = "#fda4af";
-        badge.textContent = "YouTube desativado";
-        titleEl.textContent = "Este app agora usa Instagram, Facebook, Kwai e TikTok.";
-        authorEl.textContent = "";
-        noteEl.textContent = "Cole um link válido do Instagram, Facebook, Kwai ou TikTok.";
-        return null;
-      }
-
       if (parsed) {
         state.social.platform = parsed.platform;
         state.social.url = parsed.url;
         badge.style.background = parsed.bg;
         badge.style.color = parsed.color;
         badge.textContent = `${parsed.platform} reconhecido ✓`;
-        authorEl.textContent = "Pronto para baixar com áudio";
+        authorEl.textContent = "Qualidade Máxima • Sem Marca d'Água";
         titleEl.textContent = parsed.url;
-        noteEl.textContent = 'Toque em "Preparar cortes virais" para importar o vídeo, analisar e abrir o estúdio.';
+        noteEl.textContent = 'Toque em "Preparar cortes virais" para baixar limpo e editar.';
         return parsed;
       }
 
@@ -218,8 +213,8 @@
       badge.style.color = "#fbbf24";
       badge.textContent = "Confira o link";
       authorEl.textContent = "";
-      titleEl.textContent = "Link não reconhecido";
-      noteEl.textContent = "Use um link do Instagram, Facebook, Kwai ou TikTok.";
+      titleEl.textContent = "Link inválido";
+      noteEl.textContent = "Cole o endereço completo do vídeo (YouTube, Instagram, TikTok, Kwai, Facebook, X, etc.).";
       return null;
     }
 
@@ -314,6 +309,7 @@
           height: vid.videoHeight,
           id: serverMedia ? serverMedia.id : null,
           url: serverMedia ? serverMedia.url : "",
+          cleanDownloadUrl: serverMedia ? (serverMedia.cleanDownloadUrl || serverMedia.url) : "",
           transcript: serverMedia ? (serverMedia.transcript || []) : [],
           words: [],
           tracking: [],
@@ -324,8 +320,18 @@
         state.filteredClips = [];
         document.getElementById("studio-wrapper").classList.add("hidden");
         document.getElementById("active-media-sub").textContent = `${sourceLabel} • ${vid.videoWidth}×${vid.videoHeight} • Duração: ${fmtTime(vid.duration)}`;
+
+        const rawDlBox = document.getElementById("clean-raw-download-box");
+        const rawDlLink = document.getElementById("clean-raw-download-link");
+        if (rawDlBox && rawDlLink && state.media.cleanDownloadUrl) {
+          rawDlLink.href = mediaUrl(state.media.cleanDownloadUrl);
+          rawDlBox.classList.remove("hidden");
+        } else if (rawDlBox) {
+          rawDlBox.classList.add("hidden");
+        }
+
         if (blob) switchSourceTab("local");
-        showToast("Vídeo carregado com sucesso!");
+        showToast("Vídeo carregado sem marca d'água e sem metadados!");
       } catch (error) {
         if (blob) URL.revokeObjectURL(url);
         if (version === state.sourceVersion) {
@@ -457,7 +463,7 @@
       const source = state.sourceTab;
       const parsed = source === "social" ? resolveSocialLink(document.getElementById("social-url-input").value) : null;
       if (source === "social" && !parsed) {
-        showToast("Cole um link válido do Instagram, Facebook, Kwai ou TikTok.");
+        showToast("Link inválido. Cole o endereço completo do vídeo.");
         return;
       }
       if (source === "local" && state.mediaMode !== "canvas-video") {
@@ -472,7 +478,7 @@
       try {
         await ensureBackend();
         if (source === "social" && (state.media.socialUrl !== parsed.url || !state.media.id)) {
-          setPipeProgress(3, `Importando vídeo do ${parsed.platform}...`, "Baixando vídeo original com áudio...");
+          setPipeProgress(3, `Baixando vídeo do ${parsed.platform}...`, "Buscando melhor qualidade sem marca d'água...");
           const media = await runJob(
             "/api/import",
             { url: parsed.url },
@@ -485,7 +491,7 @@
         }
 
         if (!state.media.id) {
-          setPipeProgress(5, "Preparando arquivo...", "Enviando o vídeo para análise de áudio e imagem...");
+          setPipeProgress(5, "Preparando arquivo...", "Limpando metadados e enviando para análise...");
           const media = await runRawJob(
             "/api/upload?filename=" + encodeURIComponent(state.media.title),
             state.media.blob,
@@ -493,6 +499,7 @@
           );
           state.media.id = media.id;
           state.media.url = media.url;
+          state.media.cleanDownloadUrl = media.cleanDownloadUrl || media.url;
         }
 
         const count = Number(document.getElementById("clip-count-select").value);
@@ -518,13 +525,13 @@
 
         document.getElementById("find-moment-input").value = "";
         document.getElementById("studio-wrapper").classList.remove("hidden");
-        document.getElementById("studio-source-badge").textContent = `${state.media.platform || "9:16"} • Vídeo Ativo`;
+        document.getElementById("studio-source-badge").textContent = `${state.media.platform || "9:16"} • Zero Metadata`;
 
         setPipeProgress(
           100,
           "Cortes prontos!",
           result.hasSpeech
-            ? "Fala transcrita e trechos selecionados! Use o botão Ativar/Desativar Legendas conforme desejar."
+            ? "Vídeo limpo sem marca d'água! Edite e exporte sem metadados."
             : "Trechos selecionados pelos picos de áudio e ação!"
         );
 
@@ -870,7 +877,6 @@
       if (stylesWrap) {
         stylesWrap.style.opacity = enabled ? "1" : "0.45";
       }
-      showToast(enabled ? "Legendas ativadas!" : "Legendas desativadas!");
     }
 
     function setCaptionPreset(style, autoEnable = true) {
@@ -975,13 +981,12 @@
       box.classList.remove("hidden");
       bar.style.width = "0%";
       pct.textContent = "0%";
-      status.textContent = "Preparando exportação em 1080×1920...";
+      status.textContent = "Preparando exportação em 1080×1920 sem metadados...";
 
       let stream, recorder, drawTimer;
       const tracks = [];
 
       try {
-        // Synchronous unlock on tap for iOS Safari WebAudio + <video>
         if (!state.audioGraph.ctx) {
           try {
             const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -1120,7 +1125,7 @@
         if (state.renderJob.cancelled) return;
         if (!raw.size) throw new Error("A gravação retornou um arquivo vazio.");
 
-        const filename = `bigsixx48_corte_${String(clip.rank).padStart(2, "0")}_1080x1920.mp4`;
+        const filename = `bigsixx48_corte_${String(clip.rank).padStart(2, "0")}_limpo.mp4`;
         const qs = new URLSearchParams({
           filename,
           title: clip.title || filename,
@@ -1128,7 +1133,7 @@
           duration: String(clip.duration || 0),
         });
 
-        status.textContent = "Finalizando MP4 e salvando na biblioteca...";
+        status.textContent = "Removendo metadados e salvando MP4...";
         const result = await runRawJob(
           "/api/finalize?" + qs.toString(),
           raw,
@@ -1147,7 +1152,6 @@
         const blob = await response.blob();
         const finalBlob = new Blob([blob], { type: "video/mp4" });
 
-        // Save directly into local phone IndexedDB library + refresh UI
         const serverItem = result.libraryItem || {};
         await saveItemToLocalLibrary({
           id: serverItem.id || ("loc_" + Date.now()),
@@ -1197,14 +1201,14 @@
       state.renderJob.lastUrl = url;
       state.renderJob.lastFilename = filename;
 
-      document.getElementById("modal-mp4-filename").textContent = `${filename} (${(mp4Blob.size / (1024 * 1024)).toFixed(1)} MB)`;
+      document.getElementById("modal-mp4-filename").textContent = `${filename} (${(mp4Blob.size / (1024 * 1024)).toFixed(1)} MB) • 0 Metadados`;
       document.getElementById("modal-mp4-video").src = url;
       const dlLink = document.getElementById("modal-mp4-download-link");
       dlLink.href = url;
       dlLink.download = filename;
 
       document.getElementById("mp4-ready-modal").classList.remove("hidden");
-      showToast("Corte salvo na Biblioteca e pronto para baixar!");
+      showToast("Corte limpo (sem metadados) pronto para baixar!");
     }
 
     function closeMp4Modal() {
@@ -1214,7 +1218,7 @@
 
     async function shareOrSaveMp4ToGallery() {
       const blob = state.renderJob.lastBlob;
-      const filename = state.renderJob.lastFilename || "bigsixx48_corte_1080x1920.mp4";
+      const filename = state.renderJob.lastFilename || "bigsixx48_corte_limpo.mp4";
       if (!blob) return;
       try {
         const file = new File([blob], filename, { type: "video/mp4" });
@@ -1226,7 +1230,6 @@
       document.getElementById("modal-mp4-download-link").click();
     }
 
-    /* ================= LIBRARY (INDEXEDDB + SERVER SYNC) ================= */
     function openLibraryDb() {
       return new Promise((resolve, reject) => {
         if (!window.indexedDB) {
@@ -1327,7 +1330,6 @@
       if (headerCountEl) headerCountEl.textContent = items.length;
       if (!container) return;
 
-      // Revoke old blob URLs before rebuilding
       Object.values(state.library.blobUrls).forEach(u => URL.revokeObjectURL(u));
       state.library.blobUrls = {};
       container.innerHTML = "";
@@ -1393,18 +1395,18 @@
         const url = state.library.blobUrls[item.id] || URL.createObjectURL(item.blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = item.filename || "bigsixx48_corte.mp4";
+        a.download = item.filename || "bigsixx48_corte_limpo.mp4";
         document.body.appendChild(a);
         a.click();
         a.remove();
-        showToast("Download iniciado! Verifique Arquivos → Downloads.");
+        showToast("Download iniciado!");
         return;
       }
 
       if (item.downloadUrl) {
         const a = document.createElement("a");
         a.href = mediaUrl(item.downloadUrl);
-        a.download = item.filename || "bigsixx48_corte.mp4";
+        a.download = item.filename || "bigsixx48_corte_limpo.mp4";
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -1422,7 +1424,7 @@
           blob = await resp.blob();
         }
         if (blob instanceof Blob) {
-          const file = new File([blob], item.filename || "bigsixx48_corte.mp4", { type: "video/mp4" });
+          const file = new File([blob], item.filename || "bigsixx48_corte_limpo.mp4", { type: "video/mp4" });
           if (navigator.canShare && navigator.canShare({ files: [file] })) {
             await navigator.share({ files: [file], title: item.filename });
             return;
@@ -1442,7 +1444,6 @@
       showToast("Corte removido da biblioteca.");
     }
 
-    /* ================= METADATA & EXPORT HELPERS ================= */
     function updateClipMeta(field, val) {
       const clip = state.clips[state.selectedIdx];
       if (!clip) return;
@@ -1706,5 +1707,6 @@
     setFrameMode("split");
     state.visual.fcSource = "top-center";
     document.getElementById("fc-source-select").value = "top-center";
+    setWatermarkPosition("hidden");
     setCaptionsEnabled(true);
     refreshLibrary();
