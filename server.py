@@ -299,7 +299,7 @@ def import_youtube(url: str, job_id: str) -> dict[str, Any]:
     }
     if shutil.which("node"):
         options["js_runtimes"] = {"node": {"path": shutil.which("node")}}
-    cookie_file = os.environ.get("CLIPPER_YOUTUBE_COOKIES")
+    cookie_file = "/etc/secrets/cookies.txt"
     if cookie_file and Path(cookie_file).is_file():
         options["cookiefile"] = cookie_file
     try:
