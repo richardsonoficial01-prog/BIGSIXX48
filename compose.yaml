@@ -1,0 +1,17 @@
+services:
+  clipper:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      CLIPPER_HOST: "0.0.0.0"
+      PORT: "8000"
+      WHISPER_MODEL: "${WHISPER_MODEL:-tiny}"
+      WHISPER_CACHE_DIR: "/app/.data/models"
+      CLIPPER_DATA_DIR: "/app/.data"
+    volumes:
+      - clipper-data:/app/.data
+    restart: unless-stopped
+
+volumes:
+  clipper-data:
