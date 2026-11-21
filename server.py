@@ -299,13 +299,7 @@ def import_youtube(url: str, job_id: str) -> dict[str, Any]:
     }
     if shutil.which("node"):
         options["js_runtimes"] = {"node": {"path": shutil.which("node")}}
-    secret_cookies = Path("/etc/secrets/cookies.txt")
-    if secret_cookies.is_file():
-        local_cookies = folder / "cookies.txt"
-        shutil.copyfile(secret_cookies, local_cookies)
-        options["cookiefile"] = str(local_cookies)
-        options["extractor_args"] = {"youtube": {"player_client": ["tv", "web"]}}
-        options["remote_components"] = ["ejs:github"]
+        options["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
     try:
         update_job(job_id, 4, "Conectando ao YouTube...")
         with yt_dlp.YoutubeDL(options) as downloader:
