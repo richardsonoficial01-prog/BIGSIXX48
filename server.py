@@ -27,12 +27,15 @@ UPLOADS_DIR = DATA_DIR / "uploads"
 LIBRARY_DIR = DATA_DIR / "library"
 TMP_DIR = DATA_DIR / "tmp"
 LIBRARY_INDEX_FILE = LIBRARY_DIR / "library.json"
+UPLOADS_INDEX_FILE = UPLOADS_DIR / "uploads.json"
 
 for d in (STATIC_DIR, DATA_DIR, UPLOADS_DIR, LIBRARY_DIR, TMP_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 if not LIBRARY_INDEX_FILE.exists():
     LIBRARY_INDEX_FILE.write_text("[]", encoding="utf-8")
+if not UPLOADS_INDEX_FILE.exists():
+    UPLOADS_INDEX_FILE.write_text("{}", encoding="utf-8")
 
 app = FastAPI(title="BIGSIXX48 AI Clipper", version="3.0.0")
 
@@ -67,6 +70,52 @@ class AnalyzeRequest(BaseModel):
     minDuration: int = 15
     maxDuration: int = 35
     focus: str = ""
+
+
+def load_uploads_index() -> Dict[str, Any]:
+    try:
+        data = json.loads(UPLOADS_INDEX_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_uploads_index(data: Dict[str, Any]) -> None:
+    try:
+        UPLOADS_INDEX_FILE.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+
+def recover_upload_if_missing(media_id: str) -> Optional[Path]:
+    safe_id = re.sub(r"[^a-zA-Z0-9]", "", media_id)
+    target = UPLOADS_DIR / f"{safe_id}.mp4"
+    if target.exists() and target.stat().st_size > 10_000:
+        return target
+    idx = load_uploads_index()
+    meta = idx.get(safe_id) or MEDIA_REGISTRY.get(safe_id)
+    if not meta or not meta.get("sourceUrl"):
+        return None
+    tmp_sub = TMP_DIR / f"rec_{safe_id}_{uuid.uuid4().hex[:6]}"
+    tmp_sub.mkdir(parents=True, exist_ok=True)
+    try:
+        src_url = meta["sourceUrl"]
+        resolved = resolve_redirects(src_url)
+        dl = download_via_ytdlp(resolved, tmp_sub)
+        if not dl and resolved != src_url:
+            dl = download_via_ytdlp(src_url, tmp_sub)
+        if not dl:
+            dl = download_via_html_fallback(resolved, tmp_sub)
+        if not dl:
+            return None
+        normalize_to_clean_mp4(dl["file"], target, crf="18")
+        return target if target.exists() else None
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp_sub, ignore_errors=True)
 
 
 def load_library_index() -> List[Dict[str, Any]]:
@@ -532,6 +581,7 @@ def run_import_job(job_id: str, raw_url: str) -> None:
             "title": title,
             "author": author,
             "platform": platform,
+            "sourceUrl": clean_url,
             "duration": round(info["duration"], 2),
             "width": info["width"],
             "height": info["height"],
@@ -540,6 +590,9 @@ def run_import_job(job_id: str, raw_url: str) -> None:
             "transcript": [],
         }
         MEDIA_REGISTRY[media_id] = media_obj
+        u_idx = load_uploads_index()
+        u_idx[media_id] = media_obj
+        save_uploads_index(u_idx)
         complete_job(job_id, media_obj)
     except Exception as exc:
         fail_job(job_id, f"Erro ao importar vídeo: {exc}")
@@ -686,9 +739,9 @@ def build_captions_for_window(
 def run_analyze_job(job_id: str, req: AnalyzeRequest) -> None:
     tmp_wav = TMP_DIR / f"aud_{job_id}.wav"
     try:
-        video_path = UPLOADS_DIR / f"{req.mediaId}.mp4"
-        if not video_path.exists():
-            fail_job(job_id, "Vídeo não encontrado no servidor. Importe novamente.")
+        video_path = recover_upload_if_missing(req.mediaId)
+        if not video_path or not video_path.exists():
+            fail_job(job_id, "Vídeo não encontrado no servidor. Cole o link e clique em Preparar cortes virais novamente.")
             return
 
         media_meta = MEDIA_REGISTRY.get(req.mediaId) or {}
@@ -950,11 +1003,29 @@ async def api_import(req: ImportRequest):
     return {"jobId": job_id}
 
 
+@app.get("/media/uploads/{filename}")
+async def serve_upload_with_recovery(filename: str):
+    safe_name = os.path.basename(filename)
+    file_path = UPLOADS_DIR / safe_name
+    if not file_path.exists() and safe_name.endswith(".mp4"):
+        media_id = safe_name[:-4]
+        recovered = await asyncio.get_event_loop().run_in_executor(
+            None, recover_upload_if_missing, media_id
+        )
+        if recovered and recovered.exists():
+            file_path = recovered
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Vídeo expirado após reinicialização do servidor. Reimporte o link.")
+    return FileResponse(path=str(file_path), media_type="video/mp4")
+
+
 @app.get("/api/uploads/{media_id}/download")
 async def api_download_clean_source(media_id: str):
     safe_id = re.sub(r"[^a-zA-Z0-9]", "", media_id)
-    file_path = UPLOADS_DIR / f"{safe_id}.mp4"
-    if not file_path.exists():
+    file_path = await asyncio.get_event_loop().run_in_executor(
+        None, recover_upload_if_missing, safe_id
+    )
+    if not file_path or not file_path.exists():
         raise HTTPException(status_code=404, detail="Vídeo original não encontrado.")
     return FileResponse(
         path=str(file_path),
