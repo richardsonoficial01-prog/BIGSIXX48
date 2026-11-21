@@ -323,6 +323,8 @@ def normalize_to_clean_mp4(src_path: Path, dst_path: Path, crf: str = "19") -> N
             "1",
             "-preset",
             "ultrafast",
+            "-x264-params",
+            "rc-lookahead=5:ref=1:bframes=0:sync-lookahead=0",
             "-crf",
             crf,
             "-pix_fmt",
@@ -358,6 +360,8 @@ def normalize_to_clean_mp4(src_path: Path, dst_path: Path, crf: str = "19") -> N
             "1",
             "-preset",
             "ultrafast",
+            "-x264-params",
+            "rc-lookahead=5:ref=1:bframes=0:sync-lookahead=0",
             "-crf",
             crf,
             "-pix_fmt",
@@ -662,6 +666,21 @@ def detect_audio_peaks(wav_path: Path, total_duration: float) -> List[float]:
 def try_whisper_transcribe(wav_path: Path) -> Dict[str, Any]:
     try:
         import gc
+        # Evita OOM Kill no container de 512MB RAM do Render Free
+        try:
+            with open("/sys/fs/cgroup/memory.max", "r") as mf:
+                lim = mf.read().strip()
+                if lim.isdigit() and int(lim) <= 600 * 1024 * 1024:
+                    return {"transcript": [], "words": []}
+        except Exception:
+            pass
+        try:
+            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes", "r") as mf:
+                lim = mf.read().strip()
+                if lim.isdigit() and int(lim) <= 600 * 1024 * 1024:
+                    return {"transcript": [], "words": []}
+        except Exception:
+            pass
         from faster_whisper import WhisperModel
 
         model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=1, num_workers=1)
@@ -888,10 +907,14 @@ def run_finalize_job(
                 "+bitexact",
                 "-c:v",
                 "libx264",
+                "-threads",
+                "1",
                 "-preset",
-                "veryfast",
+                "ultrafast",
+                "-x264-params",
+                "rc-lookahead=5:ref=1:bframes=0:sync-lookahead=0",
                 "-crf",
-                "18",
+                "20",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
@@ -925,10 +948,14 @@ def run_finalize_job(
                 "+bitexact",
                 "-c:v",
                 "libx264",
+                "-threads",
+                "1",
                 "-preset",
-                "veryfast",
+                "ultrafast",
+                "-x264-params",
+                "rc-lookahead=5:ref=1:bframes=0:sync-lookahead=0",
                 "-crf",
-                "18",
+                "20",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
@@ -1037,12 +1064,17 @@ async def api_download_clean_source(media_id: str):
 
 @app.post("/api/upload")
 async def api_upload(request: Request, filename: str = Query("video.mp4")):
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Arquivo de vídeo vazio.")
     job_id = create_job()
     raw_path = TMP_DIR / f"up_{job_id}_{re.sub(r'[^a-zA-Z0-9._-]+', '_', filename)}"
-    raw_path.write_bytes(body)
+    total = 0
+    with open(raw_path, "wb") as fp:
+        async for chunk in request.stream():
+            if chunk:
+                fp.write(chunk)
+                total += len(chunk)
+    if total == 0:
+        raw_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Arquivo de vídeo vazio.")
     asyncio.get_event_loop().run_in_executor(
         None, run_upload_job, job_id, raw_path, filename
     )
@@ -1064,12 +1096,17 @@ async def api_finalize(
     platform: str = Query("BIGSIXX48"),
     duration: float = Query(0.0),
 ):
-    body = await request.body()
-    if not body:
-        raise HTTPException(status_code=400, detail="Gravação vazia recebida.")
     job_id = create_job()
     raw_path = TMP_DIR / f"fin_{job_id}.bin"
-    raw_path.write_bytes(body)
+    total = 0
+    with open(raw_path, "wb") as fp:
+        async for chunk in request.stream():
+            if chunk:
+                fp.write(chunk)
+                total += len(chunk)
+    if total == 0:
+        raw_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Gravação vazia recebida.")
     asyncio.get_event_loop().run_in_executor(
         None, run_finalize_job, job_id, raw_path, filename, title, platform, duration
     )
