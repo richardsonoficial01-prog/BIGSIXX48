@@ -270,8 +270,10 @@ def normalize_to_clean_mp4(src_path: Path, dst_path: Path, crf: str = "19") -> N
             "+bitexact",
             "-c:v",
             "libx264",
+            "-threads",
+            "1",
             "-preset",
-            "veryfast",
+            "ultrafast",
             "-crf",
             crf,
             "-pix_fmt",
@@ -303,8 +305,10 @@ def normalize_to_clean_mp4(src_path: Path, dst_path: Path, crf: str = "19") -> N
             "+bitexact",
             "-c:v",
             "libx264",
+            "-threads",
+            "1",
             "-preset",
-            "veryfast",
+            "ultrafast",
             "-crf",
             crf,
             "-pix_fmt",
@@ -604,13 +608,16 @@ def detect_audio_peaks(wav_path: Path, total_duration: float) -> List[float]:
 
 def try_whisper_transcribe(wav_path: Path) -> Dict[str, Any]:
     try:
+        import gc
         from faster_whisper import WhisperModel
 
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(str(wav_path), word_timestamps=True)
+        model = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=1, num_workers=1)
+        segments, _ = model.transcribe(str(wav_path), word_timestamps=True, beam_size=1)
         transcript = []
         words = []
         for seg in segments:
+            if seg.start > 120:
+                break
             txt = (seg.text or "").strip()
             if txt:
                 transcript.append(
@@ -622,6 +629,8 @@ def try_whisper_transcribe(wav_path: Path) -> Dict[str, Any]:
                     words.append(
                         {"start": round(w.start, 2), "end": round(w.end, 2), "text": wt}
                     )
+        del model
+        gc.collect()
         return {"transcript": transcript, "words": words}
     except Exception:
         return {"transcript": [], "words": []}
@@ -1055,7 +1064,7 @@ app.mount("/media", StaticFiles(directory=str(DATA_DIR)), name="media")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def serve_root():
     index_file = STATIC_DIR / "index.html"
     if index_file.exists():
