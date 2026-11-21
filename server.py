@@ -299,7 +299,6 @@ def import_youtube(url: str, job_id: str) -> dict[str, Any]:
     }
     if shutil.which("node"):
         options["js_runtimes"] = {"node": {"path": shutil.which("node")}}
-        
     secret_cookies = Path("/etc/secrets/cookies.txt")
     if secret_cookies.is_file():
         local_cookies = folder / "cookies.txt"
