@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -14,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -34,7 +34,7 @@ for d in (STATIC_DIR, DATA_DIR, UPLOADS_DIR, LIBRARY_DIR, TMP_DIR):
 if not LIBRARY_INDEX_FILE.exists():
     LIBRARY_INDEX_FILE.write_text("[]", encoding="utf-8")
 
-app = FastAPI(title="BIGSIXX48 AI Clipper", version="2.0.0")
+app = FastAPI(title="BIGSIXX48 AI Clipper", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -48,12 +48,12 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 MEDIA_REGISTRY: Dict[str, Dict[str, Any]] = {}
 
 MOBILE_UA = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
 )
 DESKTOP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
 
@@ -143,19 +143,33 @@ def detect_social_platform(raw_url: str) -> Optional[str]:
         s = "https://" + s
     try:
         parsed = urllib.parse.urlparse(s)
-        host = (parsed.hostname or "").lower()
+        host = (parsed.hostname or "").lower().replace("www.", "")
+        if not host or "." not in host:
+            return None
     except Exception:
         return None
 
-    if any(d in host for d in ("instagram.com", "instagr.am")):
+    if "youtube.com" in host or host == "youtu.be":
+        return "YouTube"
+    if "instagram.com" in host or "instagr.am" in host:
         return "Instagram"
-    if any(d in host for d in ("facebook.com", "fb.watch", "fb.com")):
-        return "Facebook"
-    if any(d in host for d in ("kwai.com", "kwai-video.com", "kwai.net")):
-        return "Kwai"
-    if any(d in host for d in ("tiktok.com", "tiktokv.com")):
+    if "tiktok.com" in host or "tiktokv.com" in host:
         return "TikTok"
-    return None
+    if "kwai.com" in host or "kwai-video.com" in host or "kwai.net" in host:
+        return "Kwai"
+    if "facebook.com" in host or host in ("fb.watch", "fb.com"):
+        return "Facebook"
+    if host in ("x.com", "twitter.com") or host.endswith(".twitter.com"):
+        return "X (Twitter)"
+    if "twitch.tv" in host:
+        return "Twitch"
+    if "reddit.com" in host or host == "redd.it":
+        return "Reddit"
+    if "pinterest." in host or host == "pin.it":
+        return "Pinterest"
+    if "vimeo.com" in host:
+        return "Vimeo"
+    return host.split(".")[0].capitalize()
 
 
 def extract_clean_url(raw_url: str) -> str:
@@ -240,25 +254,32 @@ def has_audio_stream(path: Path) -> bool:
         return False
 
 
-def normalize_to_mp4(src_path: Path, dst_path: Path) -> None:
+def normalize_to_clean_mp4(src_path: Path, dst_path: Path, crf: str = "19") -> None:
+    """Re-codifica em H.264/AAC na melhor qualidade e apaga 100% dos metadados."""
     if has_audio_stream(src_path):
         cmd = [
             "ffmpeg",
             "-y",
             "-i",
             str(src_path),
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-fflags",
+            "+bitexact",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
-            "22",
+            crf,
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "192k",
             "-movflags",
             "+faststart",
             str(dst_path),
@@ -274,23 +295,29 @@ def normalize_to_mp4(src_path: Path, dst_path: Path) -> None:
             "-i",
             "anullsrc=channel_layout=stereo:sample_rate=44100",
             "-shortest",
+            "-map_metadata",
+            "-1",
+            "-map_chapters",
+            "-1",
+            "-fflags",
+            "+bitexact",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
             "-crf",
-            "22",
+            crf,
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
             "-b:a",
-            "128k",
+            "192k",
             "-movflags",
             "+faststart",
             str(dst_path),
         ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=360)
     if proc.returncode != 0 or not dst_path.exists() or dst_path.stat().st_size == 0:
         raise RuntimeError("Falha ao processar o arquivo de vídeo no servidor.")
 
@@ -308,17 +335,37 @@ def download_via_ytdlp(url: str, out_dir: Path) -> Optional[Dict[str, Any]]:
         "--write-info-json",
         "--user-agent",
         DESKTOP_UA,
+        "--extractor-args",
+        "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com",
         "-f",
-        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+        "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b",
         "--merge-output-format",
         "mp4",
         "-o",
         out_tpl,
         url,
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
     if proc.returncode != 0:
-        return None
+        cmd_retry = [
+            ytdlp_bin,
+            "--no-playlist",
+            "--geo-bypass",
+            "--no-warnings",
+            "--write-info-json",
+            "--user-agent",
+            MOBILE_UA,
+            "-f",
+            "bv*+ba/b",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            out_tpl,
+            url,
+        ]
+        proc2 = subprocess.run(cmd_retry, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=240)
+        if proc2.returncode != 0:
+            return None
 
     media_files = [
         p
@@ -377,11 +424,12 @@ def download_via_html_fallback(url: str, out_dir: Path) -> Optional[Dict[str, An
     title = title_match.group(1).strip() if title_match else ""
 
     patterns = [
+        r'"srcNoMark"\s*:\s*"([^"]+)"',
+        r'"playAddr"\s*:\s*"([^"]+)"',
+        r'"downloadAddr"\s*:\s*"([^"]+)"',
         r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']',
-        r'"srcNoMark"\s*:\s*"([^"]+)"',
-        r'"playAddr"\s*:\s*"([^"]+)"',
         r'"video_url"\s*:\s*"([^"]+)"',
         r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"',
         r'"hd_src"\s*:\s*"([^"]+)"',
@@ -435,7 +483,7 @@ def run_import_job(job_id: str, raw_url: str) -> None:
         if not platform:
             fail_job(
                 job_id,
-                "Link inválido. Use um link do Instagram, Facebook, Kwai ou TikTok.",
+                "Link inválido. Cole o endereço completo do vídeo.",
             )
             return
 
@@ -445,27 +493,27 @@ def run_import_job(job_id: str, raw_url: str) -> None:
         if is_cancelled(job_id):
             return
 
-        update_job(job_id, 28, f"Baixando vídeo do {platform} com áudio...")
+        update_job(job_id, 28, f"Baixando na melhor qualidade sem marca d'água ({platform})...")
         dl = download_via_ytdlp(resolved_url, tmp_sub)
         if not dl and resolved_url != clean_url:
             dl = download_via_ytdlp(clean_url, tmp_sub)
         if not dl:
-            update_job(job_id, 52, f"Extraindo stream direto do {platform}...")
+            update_job(job_id, 52, f"Extraindo stream direto sem marca d'água ({platform})...")
             dl = download_via_html_fallback(resolved_url, tmp_sub)
         if not dl:
             fail_job(
                 job_id,
-                f"Não foi possível baixar este vídeo do {platform}. Verifique se o perfil/vídeo é público ou tente outro link.",
+                f"Não foi possível baixar este vídeo do {platform}. Verifique se o link é público ou tente outro.",
             )
             return
 
         if is_cancelled(job_id):
             return
 
-        update_job(job_id, 78, "Preparando MP4 compatível com iPhone...")
+        update_job(job_id, 78, "Removendo metadados e preparando MP4 em alta definição...")
         media_id = uuid.uuid4().hex[:16]
         final_path = UPLOADS_DIR / f"{media_id}.mp4"
-        normalize_to_mp4(dl["file"], final_path)
+        normalize_to_clean_mp4(dl["file"], final_path, crf="18")
 
         info = probe_media(final_path)
         if info["duration"] <= 0.2:
@@ -484,6 +532,7 @@ def run_import_job(job_id: str, raw_url: str) -> None:
             "width": info["width"],
             "height": info["height"],
             "url": f"/media/uploads/{media_id}.mp4",
+            "cleanDownloadUrl": f"/api/uploads/{media_id}/download",
             "transcript": [],
         }
         MEDIA_REGISTRY[media_id] = media_obj
@@ -499,8 +548,8 @@ def run_upload_job(job_id: str, raw_file: Path, original_name: str) -> None:
         update_job(job_id, 25, "Recebendo arquivo de vídeo...")
         media_id = uuid.uuid4().hex[:16]
         final_path = UPLOADS_DIR / f"{media_id}.mp4"
-        update_job(job_id, 60, "Convertendo para MP4 H.264/AAC...")
-        normalize_to_mp4(raw_file, final_path)
+        update_job(job_id, 60, "Limpando metadados e convertendo para MP4 H.264/AAC...")
+        normalize_to_clean_mp4(raw_file, final_path, crf="19")
         info = probe_media(final_path)
         if info["duration"] <= 0.2:
             fail_job(job_id, "Não foi possível ler a duração do arquivo enviado.")
@@ -516,6 +565,7 @@ def run_upload_job(job_id: str, raw_file: Path, original_name: str) -> None:
             "width": info["width"],
             "height": info["height"],
             "url": f"/media/uploads/{media_id}.mp4",
+            "cleanDownloadUrl": f"/api/uploads/{media_id}/download",
             "transcript": [],
         }
         MEDIA_REGISTRY[media_id] = media_obj
@@ -538,7 +588,7 @@ def detect_audio_peaks(wav_path: Path, total_duration: float) -> List[float]:
             samples = array.array("h", frames)
             if not samples:
                 return []
-            step = max(1, rate)  # 1-second windows
+            step = max(1, rate)
             energies = []
             for idx in range(0, len(samples), step):
                 chunk = samples[idx : idx + step]
@@ -554,7 +604,7 @@ def detect_audio_peaks(wav_path: Path, total_duration: float) -> List[float]:
 
 def try_whisper_transcribe(wav_path: Path) -> Dict[str, Any]:
     try:
-        from faster_whisper import WhisperModel  # type: ignore
+        from faster_whisper import WhisperModel
 
         model = WhisperModel("tiny", device="cpu", compute_type="int8")
         segments, _ = model.transcribe(str(wav_path), word_timestamps=True)
@@ -669,7 +719,6 @@ def run_analyze_job(job_id: str, req: AnalyzeRequest) -> None:
         max_d = max(min_d, float(req.maxDuration or 35))
         target_d = min(total_dur, max(min_d, min(max_d, (min_d + max_d) / 2.0)))
 
-        # Build candidate start times from audio peaks + evenly spaced anchors
         anchors: List[float] = []
         for pk in peaks:
             st = max(0.0, min(max(0.0, total_dur - target_d), pk - target_d * 0.25))
@@ -747,7 +796,7 @@ def run_finalize_job(
     duration_hint: float,
 ) -> None:
     try:
-        update_job(job_id, 25, "Codificando MP4 1080×1920 H.264/AAC...")
+        update_job(job_id, 25, "Codificando corte editado 1080×1920 e apagando 100% dos metadados...")
         item_id = uuid.uuid4().hex[:12]
         safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", filename or f"bigsixx48_{item_id}.mp4")
         if not safe_name.lower().endswith(".mp4"):
@@ -769,20 +818,24 @@ def run_finalize_job(
                 vf,
                 "-r",
                 "30",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-fflags",
+                "+bitexact",
                 "-c:v",
                 "libx264",
                 "-preset",
                 "veryfast",
                 "-crf",
-                "21",
+                "18",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "192k",
-                "-map_metadata",
-                "-1",
                 "-movflags",
                 "+faststart",
                 str(final_path),
@@ -802,31 +855,35 @@ def run_finalize_job(
                 vf,
                 "-r",
                 "30",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-fflags",
+                "+bitexact",
                 "-c:v",
                 "libx264",
                 "-preset",
                 "veryfast",
                 "-crf",
-                "21",
+                "18",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",
                 "aac",
                 "-b:a",
                 "192k",
-                "-map_metadata",
-                "-1",
                 "-movflags",
                 "+faststart",
                 str(final_path),
             ]
 
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=360)
         if proc.returncode != 0 or not final_path.exists() or final_path.stat().st_size == 0:
             fail_job(job_id, "Falha ao finalizar o arquivo MP4 no servidor.")
             return
 
-        update_job(job_id, 85, "Salvando corte na biblioteca...")
+        update_job(job_id, 85, "Salvando corte limpo na biblioteca...")
         info = probe_media(final_path)
         size_bytes = final_path.stat().st_size
         dur = round(info["duration"] or duration_hint or 0.0, 1)
@@ -868,7 +925,7 @@ async def api_health():
     return {
         "ok": True,
         "service": "BIGSIXX48",
-        "platforms": ["Instagram", "Facebook", "Kwai", "TikTok"],
+        "platforms": ["YouTube", "Instagram", "TikTok", "Kwai", "Facebook", "X", "Qualquer Rede"],
     }
 
 
@@ -877,11 +934,25 @@ async def api_import(req: ImportRequest):
     if not detect_social_platform(req.url):
         raise HTTPException(
             status_code=400,
-            detail="Cole um link válido do Instagram, Facebook, Kwai ou TikTok.",
+            detail="Link inválido. Cole o endereço completo do vídeo.",
         )
     job_id = create_job()
     asyncio.get_event_loop().run_in_executor(None, run_import_job, job_id, req.url)
     return {"jobId": job_id}
+
+
+@app.get("/api/uploads/{media_id}/download")
+async def api_download_clean_source(media_id: str):
+    safe_id = re.sub(r"[^a-zA-Z0-9]", "", media_id)
+    file_path = UPLOADS_DIR / f"{safe_id}.mp4"
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Vídeo original não encontrado.")
+    return FileResponse(
+        path=str(file_path),
+        media_type="video/mp4",
+        filename=f"bigsixx48_original_limpo_{safe_id[:8]}.mp4",
+        headers={"Content-Disposition": f'attachment; filename="bigsixx48_original_limpo_{safe_id[:8]}.mp4"'},
+    )
 
 
 @app.post("/api/upload")
@@ -990,3 +1061,8 @@ async def serve_root():
     if index_file.exists():
         return FileResponse(str(index_file))
     return JSONResponse({"ok": True, "message": "BIGSIXX48 API ativa"})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", os.environ.get("CLIPPER_PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=port)
