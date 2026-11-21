@@ -299,9 +299,12 @@ def import_youtube(url: str, job_id: str) -> dict[str, Any]:
     }
     if shutil.which("node"):
         options["js_runtimes"] = {"node": {"path": shutil.which("node")}}
-    cookie_file = "/etc/secrets/cookies.txt"
-    if cookie_file and Path(cookie_file).is_file():
-        options["cookiefile"] = cookie_file
+        import shutil
+    secret_cookies = Path("/etc/secrets/cookies.txt")
+    if secret_cookies.is_file():
+        local_cookies = folder / "cookies.txt"
+        shutil.copyfile(secret_cookies, local_cookies)
+        options["cookiefile"] = str(local_cookies)
     try:
         update_job(job_id, 4, "Conectando ao YouTube...")
         with yt_dlp.YoutubeDL(options) as downloader:
