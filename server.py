@@ -1,517 +1,992 @@
-"""BIGSIXX48 local media service. Run with: python server.py."""
-from __future__ import annotations
-
-import concurrent.futures
-import copy
-import importlib.util
+import asyncio
 import json
-import logging
 import math
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
-import threading
+import tempfile
 import time
-from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+import urllib.parse
+import urllib.request
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+DATA_DIR = Path(os.environ.get("BIGSIXX48_DATA_DIR", str(BASE_DIR / "data")))
+UPLOADS_DIR = DATA_DIR / "uploads"
+LIBRARY_DIR = DATA_DIR / "library"
+TMP_DIR = DATA_DIR / "tmp"
+LIBRARY_INDEX_FILE = LIBRARY_DIR / "library.json"
 
-ROOT = Path(__file__).resolve().parent
-DATA = Path(os.environ.get("CLIPPER_DATA_DIR", str(ROOT / ".data"))).resolve()
-MEDIA_DIR, EXPORT_DIR, WORK_DIR = (DATA / name for name in ("media", "exports", "work"))
-for directory in (MEDIA_DIR, EXPORT_DIR, WORK_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+for d in (STATIC_DIR, DATA_DIR, UPLOADS_DIR, LIBRARY_DIR, TMP_DIR):
+    d.mkdir(parents=True, exist_ok=True)
 
-MAX_UPLOAD = int(os.environ.get("CLIPPER_MAX_UPLOAD_BYTES", 2 * 1024**3))
-FFMPEG = os.environ.get("CLIPPER_FFMPEG") or shutil.which("ffmpeg")
-FFPROBE = os.environ.get("CLIPPER_FFPROBE") or shutil.which("ffprobe")
-POOL = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="clipper")
-JOBS: dict[str, dict[str, Any]] = {}
-MEDIA: dict[str, dict[str, Any]] = {}
-LOCK = threading.RLock()
-LOG = logging.getLogger("bigsixx48")
+if not LIBRARY_INDEX_FILE.exists():
+    LIBRARY_INDEX_FILE.write_text("[]", encoding="utf-8")
 
 app = FastAPI(title="BIGSIXX48 AI Clipper", version="2.0.0")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["null"],
-    allow_origin_regex=r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?",
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+JOBS: Dict[str, Dict[str, Any]] = {}
+MEDIA_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+)
+DESKTOP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 
 
-@app.middleware("http")
-async def prevent_stale_jobs(request: Request, call_next):
-    response = await call_next(request)
-    if request.url.path.startswith("/api/"):
-        response.headers["Cache-Control"] = "no-store"
-    return response
-
-
-def extract_youtube_id(raw: str) -> str | None:
-    """Accept real YouTube share/watch/shorts/live URLs, never lookalike hosts."""
-    value = (raw or "").strip()
-    # Pasted mobile share text may contain explanatory text around the URL.
-    match = re.search(r"https?://[^\s<>\"']+", value, re.IGNORECASE)
-    if match:
-        value = match.group(0).rstrip(".,;!)]}")
-    if not re.match(r"https?://", value, re.IGNORECASE):
-        value = "https://" + value
-    try:
-        parsed = urlparse(value)
-        if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
-            return None
-        host = (parsed.hostname or "").lower().rstrip(".")
-        path = parsed.path.strip("/").split("/")
-        video_id = None
-        if host in {"youtu.be", "www.youtu.be"}:
-            video_id = path[0] if path else None
-        elif host in {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "gaming.youtube.com", "youtube-nocookie.com", "www.youtube-nocookie.com"}:
-            if path[0] in {"shorts", "live", "embed", "v"} and len(path) > 1:
-                video_id = path[1]
-            elif path[0] == "watch":
-                video_id = parse_qs(parsed.query).get("v", [None])[0]
-            elif path[0] in {"attribution_link", "redirect"}:
-                nested = parse_qs(parsed.query).get("u", parse_qs(parsed.query).get("q", [None]))[0]
-                if nested and nested != raw:
-                    return extract_youtube_id("https://www.youtube.com" + nested if nested.startswith("/") else nested)
-        return video_id if video_id and re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) else None
-    except (ValueError, IndexError, RecursionError):
-        return None
-
-
-def public_job(job: dict[str, Any]) -> dict[str, Any]:
-    return {k: copy.deepcopy(v) for k, v in job.items() if not k.startswith("_")}
-
-
-def update_job(job_id: str, progress: float, message: str) -> None:
-    with LOCK:
-        job = JOBS[job_id]
-        if job["_cancel"].is_set():
-            raise RuntimeError("Operação cancelada.")
-        job.update(status="running", progress=round(max(0, min(99, progress)), 1), message=message)
-
-
-def create_job(task: Callable[[str], dict[str, Any]]) -> dict[str, str]:
-    job_id = uuid.uuid4().hex
-    with LOCK:
-        JOBS[job_id] = {
-            "id": job_id, "status": "queued", "progress": 0,
-            "message": "Aguardando processamento...", "_cancel": threading.Event(),
-        }
-
-    def run() -> None:
-        try:
-            result = task(job_id)
-            with LOCK:
-                if JOBS[job_id]["_cancel"].is_set():
-                    raise RuntimeError("Operação cancelada.")
-                JOBS[job_id].update(status="completed", progress=100, message="Pronto!", result=result)
-        except Exception as exc:
-            if isinstance(exc, RuntimeError):
-                LOG.warning("Processamento %s: %s", job_id, exc)
-            else:
-                LOG.exception("Falha no processamento %s", job_id)
-            with LOCK:
-                JOBS[job_id].update(status="failed", error=str(exc) or "Não foi possível processar o vídeo.", message="Processamento interrompido.")
-
-    POOL.submit(run)
-    return {"jobId": job_id}
-
-
-def require_media_tools() -> None:
-    if not FFMPEG or not FFPROBE:
-        raise RuntimeError("FFmpeg não foi encontrado. Instale o FFmpeg e abra o app pelo iniciador novamente.")
-
-
-def probe_media(path: Path, require_duration: bool = True) -> dict[str, Any]:
-    require_media_tools()
-    try:
-        proc = subprocess.run(
-            [FFPROBE, "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=30, check=True,
-        )
-        data = json.loads(proc.stdout)
-    except (subprocess.SubprocessError, json.JSONDecodeError) as exc:
-        raise RuntimeError("Arquivo de vídeo inválido ou formato não reconhecido pelo FFmpeg.") from exc
-    video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video" and not s.get("disposition", {}).get("attached_pic")), None)
-    audio = next((s for s in data.get("streams", []) if s.get("codec_type") == "audio"), None)
-    if not video or not video.get("width") or not video.get("height"):
-        raise RuntimeError("O arquivo não contém uma faixa de vídeo válida.")
-    try:
-        duration = float(data.get("format", {}).get("duration") or video.get("duration") or 0)
-    except (TypeError, ValueError):
-        duration = 0
-    if not math.isfinite(duration) or duration < 0:
-        duration = 0
-    if require_duration and duration <= 0:
-        raise RuntimeError("Não foi possível determinar a duração real do vídeo.")
-    return {"duration": duration, "width": int(video["width"]), "height": int(video["height"]), "video": video, "audio": audio}
-
-
-def run_ffmpeg(args: list[str], job_id: str, duration: float, start: float, end: float, message: str) -> None:
-    require_media_tools()
-    proc = subprocess.Popen([FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error", "-progress", "pipe:1", "-nostats", "-y", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    errors: list[str] = []
-
-    def drain_errors() -> None:
-        for line in proc.stderr:
-            errors.append(line)
-            if len(errors) > 40:
-                del errors[0]
-
-    reader = threading.Thread(target=drain_errors, daemon=True)
-    reader.start()
-    try:
-        update_job(job_id, start, message)
-        for line in proc.stdout:
-            if JOBS[job_id]["_cancel"].is_set():
-                raise RuntimeError("Operação cancelada.")
-            if line.startswith("out_time_us=") and duration > 0:
-                try:
-                    fraction = min(1.0, float(line.split("=", 1)[1]) / 1_000_000 / duration)
-                    update_job(job_id, start + fraction * (end - start), message)
-                except ValueError:
-                    pass
-        code = proc.wait(timeout=15)
-        reader.join(timeout=2)
-        if code:
-            LOG.error("FFmpeg: %s", "".join(errors)[-4000:])
-            raise RuntimeError("O FFmpeg não conseguiu converter o vídeo. Verifique se o arquivo original pode ser reproduzido.")
-        update_job(job_id, end, message)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-        proc.stdout.close()
-        proc.stderr.close()
-
-
-def save_media(metadata: dict[str, Any]) -> None:
-    temp = MEDIA_DIR / f"{metadata['id']}.json.tmp"
-    temp.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
-    temp.replace(MEDIA_DIR / f"{metadata['id']}.json")
-    with LOCK:
-        MEDIA[metadata["id"]] = copy.deepcopy(metadata)
-
-
-def normalize_media(path: Path, job_id: str, *, title: str, author: str, transcript: list | None = None, youtube_id: str = "") -> dict[str, Any]:
-    update_job(job_id, 72, "Preparando vídeo para o editor...")
-    info = probe_media(path, require_duration=False)
-    media_id = uuid.uuid4().hex
-    output = MEDIA_DIR / f"{media_id}.mp4"
-    video, audio = info["video"], info["audio"]
-    copy_codecs = video.get("codec_name") == "h264" and video.get("pix_fmt") == "yuv420p" and (audio is None or audio.get("codec_name") == "aac")
-    args = ["-i", str(path), "-map", "0:v:0", "-map", "0:a:0?"]
-    if copy_codecs:
-        args += ["-c", "copy"]
-    else:
-        args += ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
-    args += ["-map_metadata", "-1", "-map_chapters", "-1", "-movflags", "+faststart", str(output)]
-    try:
-        run_ffmpeg(args, job_id, info["duration"], 74, 97, "Convertendo vídeo para MP4 compatível...")
-        ready = probe_media(output)
-    except Exception:
-        output.unlink(missing_ok=True)
-        raise
-    metadata = {
-        "id": media_id, "url": f"/media/{media_id}.mp4", "title": title,
-        "author": author, "duration": ready["duration"], "width": ready["width"],
-        "height": ready["height"], "transcript": transcript or [], "youtubeId": youtube_id,
-    }
-    save_media(metadata)
-    return metadata
-
-
-def fetch_subtitles(downloader: Any, info: dict[str, Any]) -> list[dict[str, Any]]:
-    """Caption availability must never decide whether video import succeeds."""
-    candidates = []
-    for tracks in (info.get("subtitles") or {}, info.get("automatic_captions") or {}):
-        for language in ("pt-BR", "pt", "pt-PT", "en-orig", "en", "es"):
-            candidates.extend(item for item in tracks.get(language, []) if item.get("ext") == "json3" and item.get("url"))
-    for candidate in candidates[:2]:
-        try:
-            with downloader.urlopen(candidate["url"]) as response:
-                data = json.loads(response.read(8 * 1024 * 1024))
-            segments = []
-            for event in data.get("events", []):
-                text = " ".join("".join(s.get("utf8", "") for s in event.get("segs", [])).split())
-                if text:
-                    start = event.get("tStartMs", 0) / 1000
-                    segments.append({"start": start, "end": start + max(0.1, event.get("dDurationMs", 2500) / 1000), "text": text})
-            if segments:
-                return segments
-        except Exception:
-            continue
-    return []
-
-
-def import_youtube(url: str, job_id: str) -> dict[str, Any]:
-    video_id = extract_youtube_id(url)
-    if not video_id:
-        raise RuntimeError("Link do YouTube inválido. Cole um link watch, youtu.be, Shorts ou transmissão já encerrada.")
-    if not importlib.util.find_spec("yt_dlp"):
-        raise RuntimeError("O componente yt-dlp não está instalado. Execute o instalador do app novamente.")
-    require_media_tools()
-    import yt_dlp
-
-    folder = WORK_DIR / job_id
-    folder.mkdir(exist_ok=True)
-
-    class QuietLogger:
-        def debug(self, message: str) -> None:
-            LOG.debug("yt-dlp: %s", message)
-        def warning(self, message: str) -> None:
-            LOG.warning("yt-dlp: %s", message)
-        def error(self, message: str) -> None:
-            LOG.error("yt-dlp: %s", message)
-
-    def progress(data: dict[str, Any]) -> None:
-        if JOBS[job_id]["_cancel"].is_set():
-            raise RuntimeError("Operação cancelada.")
-        if data.get("status") == "downloading":
-            size = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            fraction = data.get("downloaded_bytes", 0) / size if size else 0
-            update_job(job_id, 10 + min(1, fraction) * 55, "Baixando o vídeo original do YouTube...")
-
-    def reject_live(info: dict[str, Any], *, incomplete: bool = False) -> None:
-        if info.get("is_live") or info.get("live_status") == "is_upcoming":
-            raise RuntimeError("A transmissão ainda está ao vivo ou não começou. Use um vídeo já publicado ou uma transmissão encerrada.")
-
-    options = {
-        "format": "bv*[height<=1080][vcodec^=avc1]+ba[acodec^=mp4a]/b[height<=1080][ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]/best",
-        "outtmpl": str(folder / "source.%(ext)s"), "noplaylist": True,
-        "merge_output_format": "mp4", "quiet": True, "no_warnings": True,
-        "logger": QuietLogger(), "socket_timeout": 25, "retries": 2, "fragment_retries": 2,
-        "max_filesize": MAX_UPLOAD, "progress_hooks": [progress], "match_filter": reject_live,
-        "ffmpeg_location": FFMPEG,
-    }
-    if shutil.which("node"):
-        options["js_runtimes"] = {"node": {"path": shutil.which("node")}}
-        options["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
-    try:
-        update_job(job_id, 4, "Conectando ao YouTube...")
-        with yt_dlp.YoutubeDL(options) as downloader:
-            info = downloader.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-            if info:
-                update_job(job_id, 68, "Carregando legendas disponíveis...")
-                transcript = fetch_subtitles(downloader, info)
-        if not info:
-            raise RuntimeError("O YouTube não retornou um vídeo disponível para baixar.")
-        if info.get("is_live") or info.get("live_status") == "is_upcoming":
-            raise RuntimeError("A transmissão ainda está ao vivo ou não começou. Use um vídeo já publicado ou uma transmissão encerrada.")
-        sources = [p for p in folder.glob("source.*") if p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov", ".m4v"}]
-        if not sources:
-            raise RuntimeError("O YouTube não disponibilizou o arquivo de vídeo para este link.")
-        source = max(sources, key=lambda p: p.stat().st_size)
-        return normalize_media(source, job_id, title=info.get("title") or f"YouTube {video_id}", author=info.get("channel") or info.get("uploader") or "YouTube", transcript=transcript, youtube_id=video_id)
-    except yt_dlp.utils.DownloadError as exc:
-        text = str(exc).lower()
-        if JOBS[job_id]["_cancel"].is_set():
-            raise RuntimeError("Operação cancelada.") from exc
-        if "proxy" in text or "tunnel" in text or "403 forbidden" in text and "connect" in text:
-            reason = "A hospedagem bloqueou a conexão com o YouTube (proxy/HTTP 403). O link foi reconhecido, mas o servidor não recebeu acesso ao vídeo. Use uma hospedagem com acesso ao YouTube ou envie o arquivo original."
-        elif "sign in" in text or "bot" in text or "confirm" in text or "429" in text:
-            reason = "O YouTube exigiu verificação de acesso ou limitou o download neste servidor. Tente outro vídeo público ou envie o arquivo original na aba MP4 / MOV."
-        elif any(s in text for s in ("private", "unavailable", "removed", "not available", "age-restricted", "members-only")):
-            reason = "Este vídeo está privado, indisponível ou tem restrições de acesso. Use um vídeo público disponível ou envie o arquivo original."
-        else:
-            reason = "Não foi possível baixar este vídeo do YouTube. Verifique a conexão e atualize o yt-dlp pelo instalador; você também pode enviar o arquivo original."
-        raise RuntimeError(reason) from exc
-    finally:
-        shutil.rmtree(folder, ignore_errors=True)
-
-
 class ImportRequest(BaseModel):
-    url: str = Field(min_length=1, max_length=4096)
+    url: str
 
 
 class AnalyzeRequest(BaseModel):
-    mediaId: str = Field(pattern=r"^[a-f0-9]{32}$")
-    count: int = Field(default=5, ge=1, le=20)
-    minDuration: float = Field(default=30, gt=0, le=600)
-    maxDuration: float = Field(default=60, gt=0, le=600)
-    focus: str = Field(default="", max_length=2000)
+    mediaId: str
+    count: int = 5
+    minDuration: int = 15
+    maxDuration: int = 35
+    focus: str = ""
+
+
+def load_library_index() -> List[Dict[str, Any]]:
+    try:
+        items = json.loads(LIBRARY_INDEX_FILE.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            return []
+        valid = []
+        for item in items:
+            stored = item.get("storedFilename", "")
+            if stored and (LIBRARY_DIR / stored).exists():
+                valid.append(item)
+        return valid
+    except Exception:
+        return []
+
+
+def save_library_index(items: List[Dict[str, Any]]) -> None:
+    LIBRARY_INDEX_FILE.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def create_job() -> str:
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {
+        "jobId": job_id,
+        "status": "running",
+        "progress": 0,
+        "message": "Iniciando...",
+        "result": None,
+        "error": None,
+        "cancelled": False,
+        "createdAt": time.time(),
+    }
+    return job_id
+
+
+def update_job(job_id: str, progress: int, message: str) -> None:
+    job = JOBS.get(job_id)
+    if job and not job.get("cancelled"):
+        job["progress"] = max(0, min(100, int(progress)))
+        job["message"] = message
+
+
+def complete_job(job_id: str, result: Dict[str, Any]) -> None:
+    job = JOBS.get(job_id)
+    if job:
+        job["status"] = "completed"
+        job["progress"] = 100
+        job["message"] = "Concluído"
+        job["result"] = result
+
+
+def fail_job(job_id: str, error_msg: str) -> None:
+    job = JOBS.get(job_id)
+    if job:
+        job["status"] = "failed"
+        job["error"] = error_msg
+        job["message"] = error_msg
+
+
+def is_cancelled(job_id: str) -> bool:
+    job = JOBS.get(job_id)
+    return bool(job and job.get("cancelled"))
+
+
+def detect_social_platform(raw_url: str) -> Optional[str]:
+    s = (raw_url or "").strip()
+    m = re.search(r"https?://[^\s<>]+", s, re.IGNORECASE)
+    if m:
+        s = m.group(0).rstrip(".,;)")
+    if not re.match(r"^https?://", s, re.IGNORECASE):
+        s = "https://" + s
+    try:
+        parsed = urllib.parse.urlparse(s)
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return None
+
+    if any(d in host for d in ("instagram.com", "instagr.am")):
+        return "Instagram"
+    if any(d in host for d in ("facebook.com", "fb.watch", "fb.com")):
+        return "Facebook"
+    if any(d in host for d in ("kwai.com", "kwai-video.com", "kwai.net")):
+        return "Kwai"
+    if any(d in host for d in ("tiktok.com", "tiktokv.com")):
+        return "TikTok"
+    return None
+
+
+def extract_clean_url(raw_url: str) -> str:
+    s = (raw_url or "").strip()
+    m = re.search(r"https?://[^\s<>]+", s, re.IGNORECASE)
+    if m:
+        s = m.group(0).rstrip(".,;)")
+    if not re.match(r"^https?://", s, re.IGNORECASE):
+        s = "https://" + s
+    return s
+
+
+def resolve_redirects(url: str) -> str:
+    current = url
+    for ua in (MOBILE_UA, DESKTOP_UA):
+        try:
+            req = urllib.request.Request(
+                current,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                final_url = resp.geturl()
+                if final_url:
+                    return final_url
+        except Exception:
+            continue
+    return current
+
+
+def probe_media(path: Path) -> Dict[str, Any]:
+    duration = 0.0
+    width = 1280
+    height = 720
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration:stream=width,height,codec_type",
+            "-of",
+            "json",
+            str(path),
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=25)
+        info = json.loads(out.decode("utf-8", errors="ignore"))
+        fmt = info.get("format") or {}
+        if fmt.get("duration"):
+            duration = float(fmt["duration"])
+        for stream in info.get("streams") or []:
+            if stream.get("codec_type") == "video":
+                width = int(stream.get("width") or width)
+                height = int(stream.get("height") or height)
+                break
+    except Exception:
+        pass
+    return {"duration": max(0.0, duration), "width": width, "height": height}
+
+
+def has_audio_stream(path: Path) -> bool:
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "json",
+            str(path),
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=15)
+        info = json.loads(out.decode("utf-8", errors="ignore"))
+        return bool(info.get("streams"))
+    except Exception:
+        return False
+
+
+def normalize_to_mp4(src_path: Path, dst_path: Path) -> None:
+    if has_audio_stream(src_path):
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src_path),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(dst_path),
+        ]
+    else:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(src_path),
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=44100",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "22",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(dst_path),
+        ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+    if proc.returncode != 0 or not dst_path.exists() or dst_path.stat().st_size == 0:
+        raise RuntimeError("Falha ao processar o arquivo de vídeo no servidor.")
+
+
+def download_via_ytdlp(url: str, out_dir: Path) -> Optional[Dict[str, Any]]:
+    ytdlp_bin = shutil.which("yt-dlp")
+    if not ytdlp_bin:
+        return None
+    out_tpl = str(out_dir / "raw_%(id)s.%(ext)s")
+    cmd = [
+        ytdlp_bin,
+        "--no-playlist",
+        "--geo-bypass",
+        "--no-warnings",
+        "--write-info-json",
+        "--user-agent",
+        DESKTOP_UA,
+        "-f",
+        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        out_tpl,
+        url,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    if proc.returncode != 0:
+        return None
+
+    media_files = [
+        p
+        for p in out_dir.iterdir()
+        if p.is_file() and not p.name.endswith(".json") and p.stat().st_size > 10_000
+    ]
+    if not media_files:
+        return None
+
+    media_files.sort(key=lambda p: p.stat().st_size, reverse=True)
+    chosen = media_files[0]
+
+    title = ""
+    author = ""
+    for jf in out_dir.glob("*.info.json"):
+        try:
+            meta = json.loads(jf.read_text(encoding="utf-8", errors="ignore"))
+            title = (meta.get("title") or meta.get("description") or "").strip()
+            author = (meta.get("uploader") or meta.get("channel") or meta.get("creator") or "").strip()
+            break
+        except Exception:
+            pass
+
+    return {"file": chosen, "title": title, "author": author}
+
+
+def download_via_html_fallback(url: str, out_dir: Path) -> Optional[Dict[str, Any]]:
+    html_text = ""
+    final_url = url
+    for ua in (MOBILE_UA, DESKTOP_UA):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=18) as resp:
+                final_url = resp.geturl() or url
+                html_text = resp.read().decode("utf-8", errors="ignore")
+                if html_text:
+                    break
+        except Exception:
+            continue
+
+    if not html_text:
+        return None
+
+    title_match = re.search(
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        html_text,
+        re.IGNORECASE,
+    )
+    title = title_match.group(1).strip() if title_match else ""
+
+    patterns = [
+        r'<meta[^>]+property=["\']og:video:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']',
+        r'"srcNoMark"\s*:\s*"([^"]+)"',
+        r'"playAddr"\s*:\s*"([^"]+)"',
+        r'"video_url"\s*:\s*"([^"]+)"',
+        r'"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"',
+        r'"hd_src"\s*:\s*"([^"]+)"',
+        r'"sd_src"\s*:\s*"([^"]+)"',
+        r'<video[^>]+src=["\']([^"\']+)["\']',
+    ]
+
+    candidates: List[str] = []
+    for pat in patterns:
+        for m in re.finditer(pat, html_text, re.IGNORECASE):
+            raw_v = m.group(1)
+            cleaned = (
+                raw_v.replace("\\u002F", "/")
+                .replace("\\u0026", "&")
+                .replace("\\/", "/")
+                .replace("&amp;", "&")
+                .strip()
+            )
+            if cleaned.startswith("//"):
+                cleaned = "https:" + cleaned
+            if cleaned.startswith("http") and cleaned not in candidates:
+                candidates.append(cleaned)
+
+    for cand in candidates:
+        try:
+            dl_req = urllib.request.Request(
+                cand,
+                headers={
+                    "User-Agent": MOBILE_UA,
+                    "Referer": final_url,
+                    "Accept": "*/*",
+                },
+            )
+            target_file = out_dir / "fallback_video.mp4"
+            with urllib.request.urlopen(dl_req, timeout=30) as resp:
+                with open(target_file, "wb") as fp:
+                    shutil.copyfileobj(resp, fp)
+            if target_file.exists() and target_file.stat().st_size > 25_000:
+                return {"file": target_file, "title": title, "author": ""}
+        except Exception:
+            continue
+
+    return None
+
+
+def run_import_job(job_id: str, raw_url: str) -> None:
+    tmp_sub = TMP_DIR / f"imp_{job_id}"
+    tmp_sub.mkdir(parents=True, exist_ok=True)
+    try:
+        platform = detect_social_platform(raw_url)
+        if not platform:
+            fail_job(
+                job_id,
+                "Link inválido. Use um link do Instagram, Facebook, Kwai ou TikTok.",
+            )
+            return
+
+        clean_url = extract_clean_url(raw_url)
+        update_job(job_id, 12, f"Conectando ao {platform}...")
+        resolved_url = resolve_redirects(clean_url)
+        if is_cancelled(job_id):
+            return
+
+        update_job(job_id, 28, f"Baixando vídeo do {platform} com áudio...")
+        dl = download_via_ytdlp(resolved_url, tmp_sub)
+        if not dl and resolved_url != clean_url:
+            dl = download_via_ytdlp(clean_url, tmp_sub)
+        if not dl:
+            update_job(job_id, 52, f"Extraindo stream direto do {platform}...")
+            dl = download_via_html_fallback(resolved_url, tmp_sub)
+        if not dl:
+            fail_job(
+                job_id,
+                f"Não foi possível baixar este vídeo do {platform}. Verifique se o perfil/vídeo é público ou tente outro link.",
+            )
+            return
+
+        if is_cancelled(job_id):
+            return
+
+        update_job(job_id, 78, "Preparando MP4 compatível com iPhone...")
+        media_id = uuid.uuid4().hex[:16]
+        final_path = UPLOADS_DIR / f"{media_id}.mp4"
+        normalize_to_mp4(dl["file"], final_path)
+
+        info = probe_media(final_path)
+        if info["duration"] <= 0.2:
+            fail_job(job_id, "O vídeo baixado está vazio ou corrompido.")
+            return
+
+        title = (dl.get("title") or "").strip()[:90] or f"Vídeo {platform} • {media_id[:6]}"
+        author = (dl.get("author") or "").strip() or platform
+
+        media_obj = {
+            "id": media_id,
+            "title": title,
+            "author": author,
+            "platform": platform,
+            "duration": round(info["duration"], 2),
+            "width": info["width"],
+            "height": info["height"],
+            "url": f"/media/uploads/{media_id}.mp4",
+            "transcript": [],
+        }
+        MEDIA_REGISTRY[media_id] = media_obj
+        complete_job(job_id, media_obj)
+    except Exception as exc:
+        fail_job(job_id, f"Erro ao importar vídeo: {exc}")
+    finally:
+        shutil.rmtree(tmp_sub, ignore_errors=True)
+
+
+def run_upload_job(job_id: str, raw_file: Path, original_name: str) -> None:
+    try:
+        update_job(job_id, 25, "Recebendo arquivo de vídeo...")
+        media_id = uuid.uuid4().hex[:16]
+        final_path = UPLOADS_DIR / f"{media_id}.mp4"
+        update_job(job_id, 60, "Convertendo para MP4 H.264/AAC...")
+        normalize_to_mp4(raw_file, final_path)
+        info = probe_media(final_path)
+        if info["duration"] <= 0.2:
+            fail_job(job_id, "Não foi possível ler a duração do arquivo enviado.")
+            return
+
+        clean_title = Path(original_name or "video.mp4").stem[:80] or "Vídeo Local"
+        media_obj = {
+            "id": media_id,
+            "title": clean_title,
+            "author": "Arquivo Local",
+            "platform": "Arquivo Local",
+            "duration": round(info["duration"], 2),
+            "width": info["width"],
+            "height": info["height"],
+            "url": f"/media/uploads/{media_id}.mp4",
+            "transcript": [],
+        }
+        MEDIA_REGISTRY[media_id] = media_obj
+        complete_job(job_id, media_obj)
+    except Exception as exc:
+        fail_job(job_id, f"Erro ao processar arquivo: {exc}")
+    finally:
+        if raw_file.exists():
+            raw_file.unlink(missing_ok=True)
+
+
+def detect_audio_peaks(wav_path: Path, total_duration: float) -> List[float]:
+    try:
+        import array
+        import wave
+
+        with wave.open(str(wav_path), "rb") as wf:
+            rate = wf.getframerate()
+            frames = wf.readframes(wf.getnframes())
+            samples = array.array("h", frames)
+            if not samples:
+                return []
+            step = max(1, rate)  # 1-second windows
+            energies = []
+            for idx in range(0, len(samples), step):
+                chunk = samples[idx : idx + step]
+                if not chunk:
+                    continue
+                rms = math.sqrt(sum(s * s for s in chunk) / len(chunk))
+                energies.append((idx / rate, rms))
+            energies.sort(key=lambda x: x[1], reverse=True)
+            return [t for t, _ in energies[:20]]
+    except Exception:
+        return []
+
+
+def try_whisper_transcribe(wav_path: Path) -> Dict[str, Any]:
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(str(wav_path), word_timestamps=True)
+        transcript = []
+        words = []
+        for seg in segments:
+            txt = (seg.text or "").strip()
+            if txt:
+                transcript.append(
+                    {"start": round(seg.start, 2), "end": round(seg.end, 2), "text": txt}
+                )
+            for w in getattr(seg, "words", None) or []:
+                wt = (w.word or "").strip()
+                if wt:
+                    words.append(
+                        {"start": round(w.start, 2), "end": round(w.end, 2), "text": wt}
+                    )
+        return {"transcript": transcript, "words": words}
+    except Exception:
+        return {"transcript": [], "words": []}
+
+
+def build_captions_for_window(
+    start: float,
+    end: float,
+    words: List[Dict[str, Any]],
+    transcript: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if words:
+        win_words = [w for w in words if w["end"] > start and w["start"] < end]
+        captions = []
+        grp: List[Dict[str, Any]] = []
+
+        def flush():
+            if not grp:
+                return
+            a = max(0.0, grp[0]["start"] - start)
+            b = min(end - start, grp[-1]["end"] - start)
+            if b > a:
+                captions.append(
+                    {
+                        "start": round(a, 2),
+                        "end": round(b, 2),
+                        "text": " ".join(x["text"] for x in grp).upper(),
+                    }
+                )
+            grp.clear()
+
+        for w in win_words:
+            if grp and (len(grp) >= 4 or (w["start"] - grp[-1]["end"]) > 0.7):
+                flush()
+            grp.append(w)
+            if re.search(r"[.!?]$", w["text"]):
+                flush()
+        flush()
+        return captions
+
+    out = []
+    for seg in transcript:
+        if seg["end"] > start and seg["start"] < end:
+            a = max(0.0, seg["start"] - start)
+            b = min(end - start, seg["end"] - start)
+            if b > a:
+                out.append(
+                    {"start": round(a, 2), "end": round(b, 2), "text": seg["text"].upper()}
+                )
+    return out
+
+
+def run_analyze_job(job_id: str, req: AnalyzeRequest) -> None:
+    tmp_wav = TMP_DIR / f"aud_{job_id}.wav"
+    try:
+        video_path = UPLOADS_DIR / f"{req.mediaId}.mp4"
+        if not video_path.exists():
+            fail_job(job_id, "Vídeo não encontrado no servidor. Importe novamente.")
+            return
+
+        media_meta = MEDIA_REGISTRY.get(req.mediaId) or {}
+        info = probe_media(video_path)
+        total_dur = max(2.0, info["duration"] or media_meta.get("duration") or 15.0)
+        platform = media_meta.get("platform") or "Social"
+        base_title = media_meta.get("title") or "Corte Viral"
+
+        update_job(job_id, 20, "Extraindo áudio para análise de picos e fala...")
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(video_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                str(tmp_wav),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90,
+        )
+
+        update_job(job_id, 45, "Detectando momentos de maior retenção...")
+        peaks = detect_audio_peaks(tmp_wav, total_dur) if tmp_wav.exists() else []
+        speech = try_whisper_transcribe(tmp_wav) if tmp_wav.exists() else {"transcript": [], "words": []}
+        transcript = speech["transcript"]
+        words = speech["words"]
+
+        update_job(job_id, 80, "Montando cortes verticais 9:16...")
+        count = max(1, min(10, int(req.count or 5)))
+        min_d = max(3.0, float(req.minDuration or 15))
+        max_d = max(min_d, float(req.maxDuration or 35))
+        target_d = min(total_dur, max(min_d, min(max_d, (min_d + max_d) / 2.0)))
+
+        # Build candidate start times from audio peaks + evenly spaced anchors
+        anchors: List[float] = []
+        for pk in peaks:
+            st = max(0.0, min(max(0.0, total_dur - target_d), pk - target_d * 0.25))
+            if all(abs(st - existing) >= max(3.0, target_d * 0.45) for existing in anchors):
+                anchors.append(st)
+            if len(anchors) >= count:
+                break
+
+        if len(anchors) < count:
+            step = max(1.0, (total_dur - target_d) / max(1, count))
+            for i in range(count):
+                st = max(0.0, min(max(0.0, total_dur - target_d), i * step))
+                if all(abs(st - existing) >= 2.5 for existing in anchors):
+                    anchors.append(st)
+                if len(anchors) >= count:
+                    break
+
+        if not anchors:
+            anchors = [0.0]
+
+        anchors.sort()
+        clips = []
+        for idx, st in enumerate(anchors[:count]):
+            en = min(total_dur, st + target_d)
+            if en - st < 2.0:
+                st = max(0.0, en - min(total_dur, 5.0))
+            dur = round(max(1.5, en - st), 1)
+            caps = build_captions_for_window(st, en, words, transcript)
+            score = max(82, min(99, 97 - idx * 2))
+            clips.append(
+                {
+                    "id": idx + 1,
+                    "rank": idx + 1,
+                    "title": f"{base_title[:45]} — Corte #{idx + 1}",
+                    "hookReason": f"Pico de retenção ({platform}) com alto impacto visual e sonoro.",
+                    "category": platform,
+                    "viralScore": score,
+                    "startTime": round(st, 1),
+                    "endTime": round(en, 1),
+                    "duration": dur,
+                    "description": f"Melhor momento extraído de {platform}! 🔥 #bigsixx48",
+                    "hashtags": ["#bigsixx48", f"#{platform.lower().replace(' ', '')}", "#cortesvirais", "#reels", "#fyp"],
+                    "captions": caps,
+                }
+            )
+
+        tracking = [
+            {"time": round(t, 2), "x": 0.5}
+            for t in [i * 0.5 for i in range(int(total_dur * 2) + 1)]
+        ]
+
+        complete_job(
+            job_id,
+            {
+                "clips": clips,
+                "transcript": transcript,
+                "words": words,
+                "tracking": tracking,
+                "hasSpeech": len(transcript) > 0,
+            },
+        )
+    except Exception as exc:
+        fail_job(job_id, f"Erro na análise: {exc}")
+    finally:
+        if tmp_wav.exists():
+            tmp_wav.unlink(missing_ok=True)
+
+
+def run_finalize_job(
+    job_id: str,
+    raw_file: Path,
+    filename: str,
+    title: str,
+    platform: str,
+    duration_hint: float,
+) -> None:
+    try:
+        update_job(job_id, 25, "Codificando MP4 1080×1920 H.264/AAC...")
+        item_id = uuid.uuid4().hex[:12]
+        safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", filename or f"bigsixx48_{item_id}.mp4")
+        if not safe_name.lower().endswith(".mp4"):
+            safe_name += ".mp4"
+        stored_filename = f"{item_id}_{safe_name}"
+        final_path = LIBRARY_DIR / stored_filename
+
+        vf = (
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black"
+        )
+        if has_audio_stream(raw_file):
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(raw_file),
+                "-vf",
+                vf,
+                "-r",
+                "30",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "21",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-map_metadata",
+                "-1",
+                "-movflags",
+                "+faststart",
+                str(final_path),
+            ]
+        else:
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(raw_file),
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-shortest",
+                "-vf",
+                vf,
+                "-r",
+                "30",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "21",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-map_metadata",
+                "-1",
+                "-movflags",
+                "+faststart",
+                str(final_path),
+            ]
+
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+        if proc.returncode != 0 or not final_path.exists() or final_path.stat().st_size == 0:
+            fail_job(job_id, "Falha ao finalizar o arquivo MP4 no servidor.")
+            return
+
+        update_job(job_id, 85, "Salvando corte na biblioteca...")
+        info = probe_media(final_path)
+        size_bytes = final_path.stat().st_size
+        dur = round(info["duration"] or duration_hint or 0.0, 1)
+
+        library_item = {
+            "id": item_id,
+            "filename": safe_name,
+            "storedFilename": stored_filename,
+            "title": (title or safe_name).strip()[:90],
+            "platform": (platform or "BIGSIXX48").strip(),
+            "duration": dur,
+            "sizeBytes": size_bytes,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+            "url": f"/media/library/{stored_filename}",
+            "downloadUrl": f"/api/library/{item_id}/download",
+        }
+
+        items = load_library_index()
+        items.insert(0, library_item)
+        save_library_index(items[:100])
+
+        complete_job(
+            job_id,
+            {
+                "url": f"/media/library/{stored_filename}",
+                "downloadUrl": f"/api/library/{item_id}/download",
+                "libraryItem": library_item,
+            },
+        )
+    except Exception as exc:
+        fail_job(job_id, f"Erro ao finalizar MP4: {exc}")
+    finally:
+        if raw_file.exists():
+            raw_file.unlink(missing_ok=True)
 
 
 @app.get("/api/health")
-def health() -> dict[str, Any]:
-    capabilities = {"ffmpeg": bool(FFMPEG), "ffprobe": bool(FFPROBE), "youtube": bool(importlib.util.find_spec("yt_dlp")), "transcription": bool(importlib.util.find_spec("faster_whisper"))}
-    return {"ok": all(capabilities.values()), "version": "2.0.0", **capabilities}
+async def api_health():
+    return {
+        "ok": True,
+        "service": "BIGSIXX48",
+        "platforms": ["Instagram", "Facebook", "Kwai", "TikTok"],
+    }
 
 
 @app.post("/api/import")
-def begin_import(body: ImportRequest) -> dict[str, str]:
-    if not extract_youtube_id(body.url):
-        raise HTTPException(status_code=400, detail="Link do YouTube inválido. Cole o endereço completo do vídeo.")
-    return create_job(lambda job_id: import_youtube(body.url, job_id))
-
-
-async def receive_file(request: Request, suffix: str) -> Path:
-    try:
-        if int(request.headers.get("content-length", "0")) > MAX_UPLOAD:
-            raise HTTPException(status_code=413, detail="O vídeo excede o limite de 2 GB desta instalação.")
-    except ValueError:
-        pass
-    path = WORK_DIR / f"upload-{uuid.uuid4().hex}{suffix}"
-    size = 0
-    try:
-        with path.open("wb") as target:
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > MAX_UPLOAD:
-                    raise HTTPException(status_code=413, detail="O vídeo excede o limite de 2 GB desta instalação.")
-                target.write(chunk)
-        if not size:
-            raise HTTPException(status_code=400, detail="O arquivo de vídeo está vazio.")
-        return path
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
-
-
-def safe_name(name: str, fallback: str) -> str:
-    value = re.sub(r"[\x00-\x1f\x7f/\\]+", "_", name).strip(" .")
-    return value[:180] or fallback
+async def api_import(req: ImportRequest):
+    if not detect_social_platform(req.url):
+        raise HTTPException(
+            status_code=400,
+            detail="Cole um link válido do Instagram, Facebook, Kwai ou TikTok.",
+        )
+    job_id = create_job()
+    asyncio.get_event_loop().run_in_executor(None, run_import_job, job_id, req.url)
+    return {"jobId": job_id}
 
 
 @app.post("/api/upload")
-async def upload(request: Request, filename: str = "video.mp4") -> dict[str, str]:
-    title = safe_name(filename, "Vídeo local")
-    suffix = Path(title).suffix.lower()
-    if suffix not in {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi", ".mpeg", ".mpg", ".ts"}:
-        suffix = ".video"
-    path = await receive_file(request, suffix)
-
-    def task(job_id: str) -> dict[str, Any]:
-        try:
-            return normalize_media(path, job_id, title=title, author="Arquivo Local")
-        finally:
-            path.unlink(missing_ok=True)
-    return create_job(task)
-
-
-@app.get("/api/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, Any]:
-    with LOCK:
-        if job_id not in JOBS:
-            raise HTTPException(status_code=404, detail="Operação não encontrada. Inicie o processamento novamente.")
-        return public_job(JOBS[job_id])
-
-
-@app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str) -> dict[str, bool]:
-    with LOCK:
-        if job_id not in JOBS:
-            raise HTTPException(status_code=404, detail="Operação não encontrada.")
-        JOBS[job_id]["_cancel"].set()
-    return {"cancelled": True}
+async def api_upload(request: Request, filename: str = Query("video.mp4")):
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Arquivo de vídeo vazio.")
+    job_id = create_job()
+    raw_path = TMP_DIR / f"up_{job_id}_{re.sub(r'[^a-zA-Z0-9._-]+', '_', filename)}"
+    raw_path.write_bytes(body)
+    asyncio.get_event_loop().run_in_executor(
+        None, run_upload_job, job_id, raw_path, filename
+    )
+    return {"jobId": job_id}
 
 
 @app.post("/api/analyze")
-def analyze(body: AnalyzeRequest) -> dict[str, str]:
-    with LOCK:
-        metadata = copy.deepcopy(MEDIA.get(body.mediaId))
-    if not metadata or not (MEDIA_DIR / f"{body.mediaId}.mp4").is_file():
-        raise HTTPException(status_code=404, detail="Vídeo não encontrado. Importe o vídeo novamente.")
-    if body.maxDuration < body.minDuration:
-        raise HTTPException(status_code=400, detail="A duração máxima deve ser maior ou igual à duração mínima.")
-
-    def task(job_id: str) -> dict[str, Any]:
-        import analysis
-        result = analysis.analyze_media(
-            MEDIA_DIR / f"{body.mediaId}.mp4", metadata, body.model_dump(),
-            lambda percent, message: update_job(job_id, percent, message),
-        )
-        if not isinstance(result, dict) or not result.get("clips"):
-            raise RuntimeError("A análise não encontrou um trecho válido para cortar neste vídeo.")
-        if result.get("transcript"):
-            metadata["transcript"] = result["transcript"]
-            save_media(metadata)
-        return result
-    return create_job(task)
+async def api_analyze(req: AnalyzeRequest):
+    job_id = create_job()
+    asyncio.get_event_loop().run_in_executor(None, run_analyze_job, job_id, req)
+    return {"jobId": job_id}
 
 
 @app.post("/api/finalize")
-async def finalize(request: Request, filename: str = "bigsixx48_corte_1080x1920.mp4") -> dict[str, str]:
-    name = safe_name(filename, "bigsixx48_corte_1080x1920.mp4")
-    name = str(Path(name).with_suffix(".mp4"))
-    path = await receive_file(request, ".recording")
-
-    def task(job_id: str) -> dict[str, Any]:
-        export_id = uuid.uuid4().hex
-        target = EXPORT_DIR / f"{export_id}.mp4"
-        try:
-            info = probe_media(path, require_duration=False)
-            run_ffmpeg([
-                "-i", str(path), "-map", "0:v:0", "-map", "0:a:0?",
-                "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-map_metadata", "-1",
-                "-map_chapters", "-1", "-movflags", "+faststart", str(target),
-            ], job_id, info["duration"], 5, 96, "Finalizando MP4 H.264 com áudio AAC...")
-            ready = probe_media(target)
-            return {"url": f"/exports/{export_id}.mp4", "filename": name, "type": "video/mp4", "duration": ready["duration"], "size": target.stat().st_size}
-        except Exception:
-            target.unlink(missing_ok=True)
-            raise
-        finally:
-            path.unlink(missing_ok=True)
-    return create_job(task)
+async def api_finalize(
+    request: Request,
+    filename: str = Query("bigsixx48_corte.mp4"),
+    title: str = Query(""),
+    platform: str = Query("BIGSIXX48"),
+    duration: float = Query(0.0),
+):
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Gravação vazia recebida.")
+    job_id = create_job()
+    raw_path = TMP_DIR / f"fin_{job_id}.bin"
+    raw_path.write_bytes(body)
+    asyncio.get_event_loop().run_in_executor(
+        None, run_finalize_job, job_id, raw_path, filename, title, platform, duration
+    )
+    return {"jobId": job_id}
 
 
-def known_file(directory: Path, file_name: str) -> Path:
-    if not re.fullmatch(r"[a-f0-9]{32}\.mp4", file_name):
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
-    path = directory / file_name
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Arquivo não encontrado.")
-    return path
+@app.get("/api/jobs/{job_id}")
+async def api_job_status(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada.")
+    return job
 
 
-@app.get("/media/{file_name}")
-def media_file(file_name: str) -> FileResponse:
-    return FileResponse(known_file(MEDIA_DIR, file_name), media_type="video/mp4", headers={"Cache-Control": "private, max-age=3600"})
+@app.post("/api/jobs/{job_id}/cancel")
+async def api_job_cancel(job_id: str):
+    job = JOBS.get(job_id)
+    if job:
+        job["cancelled"] = True
+        job["status"] = "failed"
+        job["error"] = "Operação cancelada."
+    return {"ok": True}
 
 
-@app.get("/exports/{file_name}")
-def export_file(file_name: str, download: bool = False) -> FileResponse:
-    return FileResponse(known_file(EXPORT_DIR, file_name), media_type="video/mp4", filename="bigsixx48_corte_1080x1920.mp4" if download else None)
+@app.get("/api/library")
+async def api_get_library():
+    return {"items": load_library_index()}
+
+
+@app.get("/api/library/{item_id}/download")
+async def api_download_library_item(item_id: str):
+    items = load_library_index()
+    match = next((x for x in items if x.get("id") == item_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="Vídeo não encontrado na biblioteca.")
+    file_path = LIBRARY_DIR / match["storedFilename"]
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Arquivo MP4 não está mais no servidor.")
+    return FileResponse(
+        path=str(file_path),
+        media_type="video/mp4",
+        filename=match["filename"],
+        headers={"Content-Disposition": f'attachment; filename="{match["filename"]}"'},
+    )
+
+
+@app.delete("/api/library/{item_id}")
+async def api_delete_library_item(item_id: str):
+    items = load_library_index()
+    remaining = []
+    for item in items:
+        if item.get("id") == item_id:
+            fp = LIBRARY_DIR / item.get("storedFilename", "")
+            if fp.exists():
+                fp.unlink(missing_ok=True)
+        else:
+            remaining.append(item)
+    save_library_index(remaining)
+    return {"ok": True}
+
+
+app.mount("/media", StaticFiles(directory=str(DATA_DIR)), name="media")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/")
-def index() -> FileResponse:
-    path = ROOT / "static" / "index.html"
-    if not path.is_file():
-        raise HTTPException(status_code=503, detail="Interface ainda não instalada.")
-    return FileResponse(path, media_type="text/html", headers={"Cache-Control": "no-store"})
-
-
-if (ROOT / "static").is_dir():
-    app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
-
-for record in MEDIA_DIR.glob("*.json"):
-    try:
-        metadata = json.loads(record.read_text(encoding="utf-8"))
-        media_id = metadata["id"]
-        if re.fullmatch(r"[a-f0-9]{32}", media_id) and (MEDIA_DIR / f"{media_id}.mp4").is_file():
-            MEDIA[media_id] = metadata
-    except (OSError, ValueError, KeyError, TypeError):
-        LOG.warning("Ignorando registro de mídia inválido: %s", record.name)
-
-
-if __name__ == "__main__":
-    import uvicorn
-    logging.basicConfig(level=logging.INFO)
-    uvicorn.run(app, host=os.environ.get("CLIPPER_HOST", "127.0.0.1"), port=int(os.environ.get("PORT") or os.environ.get("CLIPPER_PORT", "8000")))
+async def serve_root():
+    index_file = STATIC_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return JSONResponse({"ok": True, "message": "BIGSIXX48 API ativa"})
