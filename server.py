@@ -304,7 +304,7 @@ def import_youtube(url: str, job_id: str) -> dict[str, Any]:
         local_cookies = folder / "cookies.txt"
         shutil.copyfile(secret_cookies, local_cookies)
         options["cookiefile"] = str(local_cookies)
-                options["extractor_args"] = {"youtube": {"player_client": ["tv", "web"]}}
+        options["extractor_args"] = {"youtube": {"player_client": ["tv", "web"]}}
     try:
         update_job(job_id, 4, "Conectando ao YouTube...")
         with yt_dlp.YoutubeDL(options) as downloader:
